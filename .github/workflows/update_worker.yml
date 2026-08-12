@@ -1,31 +1,35 @@
-name: Build patched V8 d8 (6 reusable workers)
+name: "[Worker] Rebuild patched V8 releases"
 
 on:
-  schedule:
-    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
+      shard_index:
+        description: "分片索引 (0-based)"
+        required: true
+        default: "0"
+      shard_total:
+        description: "总分片数"
+        required: true
+        default: "1"
       max_per_run:
-        description: "本次最多处理多少个版本（安全上限 18）"
+        description: "本 worker 最多处理多少个版本"
         required: false
-        default: "18"
+        default: "6"
+
 permissions:
   contents: write
   actions: write
 
-concurrency:
-  group: build-patched-v8
-  cancel-in-progress: false
+# 不设 concurrency，允许多个 worker 并行运行
 
 env:
   V8_REPO: https://github.com/v8/v8.git
-  MIN_VERSION: 5.1.0
-  MAX_PER_RUN: ${{ github.event.inputs.max_per_run || '18' }}
+  MAX_PER_RUN: ${{ github.event.inputs.max_per_run || '6' }}
   SLOTS_PER_OS: 6
 
 jobs:
   determine-versions:
-    name: Determine unprocessed versions
+    name: "Shard ${{ github.event.inputs.shard_index }}/${{ github.event.inputs.shard_total }} — Determine versions"
     runs-on: ubuntu-latest
     outputs:
       versions_json: ${{ steps.determine.outputs.versions }}
@@ -37,15 +41,16 @@ jobs:
       - name: Ensure tracking JSON
         run: |
           mkdir -p public
-          [ -f public/version.json ] || echo "[]" > public/version.json
-          [ -f public/failed.json ] || echo "[]" > public/failed.json
-          [ -f public/retry_needed.json ] || echo "[]" > public/retry_needed.json
-      - name: Determine versions
+          [ -f public/update_needed.json ] || echo "[]" > public/update_needed.json
+      - name: Determine versions for this shard
         id: determine
-        run: python3 determine_versions.py
+        env:
+          SHARD_INDEX: ${{ github.event.inputs.shard_index }}
+          SHARD_TOTAL: ${{ github.event.inputs.shard_total }}
+        run: python3 determine_update_versions.py
 
   build:
-    name: Build slot ${{ matrix.slot }} / ${{ matrix.os }}
+    name: "Shard ${{ github.event.inputs.shard_index }} — Slot ${{ matrix.slot }} / ${{ matrix.os }}"
     needs: determine-versions
     if: needs.determine-versions.outputs.has_versions == 'true'
     runs-on: ${{ matrix.os }}
@@ -69,7 +74,7 @@ jobs:
         run: |
           git config --global core.autocrlf false
           git config --global core.longpaths true
-        
+
       - name: Write versions.json
         run: |
           echo '${{ env.ALL_VERSIONS }}' > versions.json
@@ -269,7 +274,7 @@ jobs:
         if: always() && steps.partition.outputs.has_any == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: build-batch-${{ matrix.os }}-slot${{ matrix.slot }}
+          name: update-shard${{ github.event.inputs.shard_index }}-${{ matrix.os }}-slot${{ matrix.slot }}
           path: |
             artifacts/**
             success_versions.txt
@@ -277,15 +282,16 @@ jobs:
           retention-days: 7
 
   aggregate-and-release:
-    name: Aggregate & release
+    name: "Shard ${{ github.event.inputs.shard_index }} — Aggregate & update releases"
     needs: [determine-versions, build]
     if: always() && needs.determine-versions.outputs.has_versions == 'true'
     runs-on: ubuntu-latest
-    outputs:
-      leftover_total: ${{ needs.determine-versions.outputs.leftover_total }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+      - name: Pull latest tracking files
+        run: |
+          git pull --rebase origin main || git pull --ff-only origin main || true
       - name: Download all batch artifacts
         uses: actions/download-artifact@v4
         with:
@@ -299,23 +305,39 @@ jobs:
         run: |
           set -e
           mkdir -p public
-          [ -f public/version.json ] || echo "[]" > public/version.json
-          [ -f public/failed.json ] || echo "[]" > public/failed.json
-          [ -f public/retry_needed.json ] || echo "[]" > public/retry_needed.json
+          [ -f public/update_needed.json ] || echo "[]" > public/update_needed.json
           find downloaded -type f -name success_versions.txt -exec cat {} \; > _all_success.txt || true
           find downloaded -type f -name failed_versions.txt -exec cat {} \; > _all_failed.txt || true
           tr -d '\r' < _all_success.txt | sed '/^$/d' | sort -Vu > _all_success.normalized
           mv _all_success.normalized _all_success.txt
           tr -d '\r' < _all_failed.txt | sed '/^$/d' | sort -Vu > _all_failed.normalized
           mv _all_failed.normalized _all_failed.txt
-          python3 tools/update_failed_versions.py \
-            --failed-json public/failed.json --add-file _all_failed.txt
       - name: Reconstruct per-version dirs
-        run: >-
-          python3 tools/reconstruct_release_artifacts.py
-          --input downloaded
-          --output stage
-      - name: Create releases & update version.json
+        run: |
+          set -e
+          mkdir -p stage
+          find downloaded -type f \( -name d8 -o -name d8.exe \) | while read -r bin; do
+            base=$(basename "$(dirname "$bin")")
+            ver="${base#d8-}"
+            if echo "$base" | grep -q "\-Linux$"; then
+              ver="${ver%-Linux}"
+              tgt="stage/d8-${ver}-Linux"
+              mkdir -p "$tgt"
+              cp "$bin" "$tgt/d8"
+              rep_dir=$(dirname "$bin")
+              [ -f "$rep_dir/snapshot_blob.bin" ] && cp "$rep_dir/snapshot_blob.bin" "$tgt/snapshot_blob.bin"
+              [ -f "$rep_dir/apply_patch_report.txt" ] && cp "$rep_dir/apply_patch_report.txt" "$tgt/"
+            elif echo "$base" | grep -q "\-Windows$"; then
+              ver="${ver%-Windows}"
+              tgt="stage/d8-${ver}-Windows"
+              mkdir -p "$tgt"
+              cp "$bin" "$tgt/d8.exe"
+              rep_dir=$(dirname "$bin")
+              [ -f "$rep_dir/snapshot_blob.bin" ] && cp "$rep_dir/snapshot_blob.bin" "$tgt/snapshot_blob.bin"
+              [ -f "$rep_dir/apply_patch_report.txt" ] && cp "$rep_dir/apply_patch_report.txt" "$tgt/"
+            fi
+          done
+      - name: Update releases (archive old assets and upload rebuilt assets)
         env:
           ALL_VERSIONS: ${{ needs.determine-versions.outputs.versions_json }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -324,8 +346,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          [ -f public/version.json ] || echo "[]" > public/version.json
-          updated=false
+          # 重新 pull 以获取其他 worker 可能已提交的更新
+          git pull --rebase origin main || git pull --ff-only origin main || true
+
+          [ -f public/update_needed.json ] || echo "[]" > public/update_needed.json
+
           for v in $(echo "${ALL_VERSIONS}" | jq -r '.[]'); do
             LIN_DIR="stage/d8-${v}-Linux"
             WIN_DIR="stage/d8-${v}-Windows"
@@ -333,85 +358,89 @@ jobs:
             LIN_SNAP="${LIN_DIR}/snapshot_blob.bin"
             WIN_BIN="${WIN_DIR}/d8.exe"
             WIN_SNAP="${WIN_DIR}/snapshot_blob.bin"
-            
+
             mkdir -p "public/$v"
             if [ ! -f "$LIN_BIN" ] || [ ! -f "$LIN_SNAP" ] || \
                [ ! -f "$WIN_BIN" ] || [ ! -f "$WIN_SNAP" ]; then
               echo "Skip release $v: both Linux and Windows artifacts are required."
-              printf '%s\n' "$v" > _missing_release.txt
-              python3 tools/update_failed_versions.py \
-                --failed-json public/failed.json --add-file _missing_release.txt
-              python3 tools/update_failed_versions.py \
-                --failed-json public/retry_needed.json --remove "$v"
               continue
             fi
-            ASSETS=()
+            NEW_ASSETS=()
 
             tar_name="public/$v/d8-${v}-linux.tar.gz"
             tar -C "$LIN_DIR" -czf "$tar_name" d8 snapshot_blob.bin
-            ASSETS+=("$tar_name")
+            NEW_ASSETS+=("$tar_name")
             zip_name="public/$v/d8-${v}-windows.zip"
             zip -j -9 "$zip_name" "$WIN_BIN" "$WIN_SNAP" >/dev/null
-            ASSETS+=("$zip_name")
+            NEW_ASSETS+=("$zip_name")
 
             notes="Patched d8 for V8 $v (includes d8 + snapshot_blob.bin)."
-            
+
             if gh release view "$v" >/dev/null 2>&1; then
-              echo "Release $v exists. Uploading / replacing assets..."
-              gh release upload "$v" "${ASSETS[@]}" --clobber
+              echo "Release $v exists. Renaming old assets with -old suffix..."
+              existing_assets=$(gh release view "$v" --json assets --jq '.assets[].name' 2>/dev/null || true)
+
+              mkdir -p "old_assets_tmp"
+              for asset_name in $existing_assets; do
+                if echo "$asset_name" | grep -q "\-old\."; then
+                  echo "  Skipping already renamed asset: $asset_name"
+                  continue
+                fi
+
+                echo "  Downloading old asset: $asset_name"
+                gh release download "$v" --pattern "$asset_name" --dir "old_assets_tmp" --clobber 2>/dev/null || {
+                  echo "  Failed to download $asset_name, skipping rename."
+                  continue
+                }
+
+                if echo "$asset_name" | grep -q "\.tar\.gz$"; then
+                  old_name="${asset_name%.tar.gz}-old.tar.gz"
+                elif echo "$asset_name" | grep -q "\.zip$"; then
+                  old_name="${asset_name%.zip}-old.zip"
+                else
+                  old_name="${asset_name}-old"
+                fi
+
+                echo "  Renaming: $asset_name -> $old_name"
+                mv "old_assets_tmp/$asset_name" "old_assets_tmp/$old_name"
+                gh release upload "$v" "old_assets_tmp/$old_name" --clobber 2>/dev/null || true
+                gh release delete-asset "$v" "$asset_name" --yes 2>/dev/null || true
+              done
+              rm -rf "old_assets_tmp"
+
+              echo "  Uploading rebuilt assets for $v..."
+              gh release upload "$v" "${NEW_ASSETS[@]}" --clobber
+              gh release edit "$v" --notes "$notes" 2>/dev/null || true
             else
               echo "Release $v does not exist. Creating tag and new release..."
               if ! git rev-parse -q --verify "refs/tags/$v"; then
                 git tag "$v" -m "Release for V8 version $v"
                 git push origin "$v"
               fi
-              gh release create "$v" "${ASSETS[@]}" --title "$v" --notes "$notes"
+              gh release create "$v" "${NEW_ASSETS[@]}" --title "$v" --notes "$notes"
             fi
 
-            if ! jq -e --arg v "$v" '.[] | select(. == $v)' public/version.json >/dev/null; then
-              jq --arg v "$v" '. + [$v]' public/version.json > public/.tmp && mv public/.tmp public/version.json
-              updated=true
-            fi
-            # A version leaves the failure blacklist only after both platform
-            # artifacts were reconstructed and its release was updated.
-            python3 tools/update_failed_versions.py \
-              --failed-json public/failed.json --remove "$v"
-            python3 tools/update_failed_versions.py \
-              --failed-json public/retry_needed.json --remove "$v"
+            # 原子地从 update_needed.json 中移除（先 pull 避免冲突）
+            git pull --rebase origin main || git pull --ff-only origin main || true
+            jq --arg v "$v" 'map(select(. != $v))' public/update_needed.json > public/.tmp && mv public/.tmp public/update_needed.json
+            echo "=== Successfully updated release for $v ==="
           done
 
-          if [ "$updated" = true ]; then
-            jq '[.[]] | sort_by((split(".")+["0","0","0","0"])[0:4]|map(tonumber))' public/version.json > public/.tmp && mv public/.tmp public/version.json
-          fi
-          echo "version.json:"; cat public/version.json
-          echo "failed.json:";  cat public/failed.json
+          echo "update_needed.json (remaining):"; cat public/update_needed.json
       - name: Commit & push tracking
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add public
-          git commit -m "Update tracking (batch build) [skip ci]" || echo "No changes to commit."
-          git push
-
-  trigger-next-batch:
-    name: Trigger next batch
-    needs: [aggregate-and-release]
-    if: needs.aggregate-and-release.outputs.leftover_total != '' && needs.aggregate-and-release.outputs.leftover_total != '0'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Dispatch next
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NEXT_MAX: ${{ env.MAX_PER_RUN }}
-        run: |
-          REF="${GITHUB_REF_NAME:-${GITHUB_REF##*/}}"
-          if [ -z "$REF" ]; then
-            REF=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
-              https://api.github.com/repos/${GITHUB_REPOSITORY} | jq -r '.default_branch')
-          fi
-          curl -s -X POST \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/main.yml/dispatches \
-            -d "{\"ref\":\"${REF}\",\"inputs\":{\"max_per_run\":\"${NEXT_MAX}\"}}"
-          echo "Next batch dispatched."
+          # 循环重试 push，处理多 worker 并发提交冲突
+          for attempt in 1 2 3 4 5; do
+            git add public
+            git diff --cached --quiet && { echo "No changes to commit."; break; }
+            git commit -m "Update rebuild tracking (shard ${{ github.event.inputs.shard_index }}) [skip ci]" || true
+            if git push; then
+              echo "Push succeeded on attempt $attempt."
+              break
+            else
+              echo "Push failed (attempt $attempt), pulling and retrying..."
+              git pull --rebase origin main || git pull --ff-only origin main || true
+            fi
+          done
